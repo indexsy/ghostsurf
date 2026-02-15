@@ -1,0 +1,49 @@
+{
+  "profiles": {
+    "default": {
+      "name": "Default",
+      "color": "#e94560",
+      "proxy": {
+        "enabled": false,
+        "type": "http",
+        "host": "",
+        "port": 0,
+        "username": "",
+        "password": ""
+      },
+      "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      "homepage": "https://www.reddit.com",
+      "privacy": {
+        "block_webrtc": true,
+        "spoof_canvas": true,
+        "spoof_webgl": true,
+        "block_third_party_cookies": true,
+        "do_not_track": true
+      },
+      "notes": ""
+    },
+    "reddit-alt1": {
+      "name": "Reddit Alt 1",
+      "color": "#4ecca3",
+      "proxy": {
+        "enabled": true,
+        "type": "http",
+        "host": "your-proxy-host.com",
+        "port": 17521,
+        "username": "your-proxy-username",
+        "password": "your-proxy-password"
+      },
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+      "homepage": "https://www.reddit.com",
+      "privacy": {
+        "block_webrtc": true,
+        "spoof_canvas": true,
+        "spoof_webgl": true,
+        "block_third_party_cookies": true,
+        "do_not_track": true
+      },
+      "notes": "u/your-reddit-username"
+    }
+  },
+  "version": "1.0.0"
+}

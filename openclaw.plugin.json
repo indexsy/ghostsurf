@@ -1,0 +1,97 @@
+{
+  "name": "ghostsurf",
+  "version": "1.0.0",
+  "description": "GhostSurf privacy browser with multi-profile support and proxy isolation",
+  "homepage": "http://127.0.0.1:9378",
+  "tools": [
+    {
+      "name": "ghostsurf_status",
+      "description": "Get current browser status including active profile, open tabs, and available profiles",
+      "endpoint": "GET /status"
+    },
+    {
+      "name": "ghostsurf_list_profiles",
+      "description": "List all browser profiles with their configurations (proxy, user agent, privacy settings)",
+      "endpoint": "GET /profiles"
+    },
+    {
+      "name": "ghostsurf_list_tabs",
+      "description": "List all open browser tabs with their URLs and titles",
+      "endpoint": "GET /tabs"
+    },
+    {
+      "name": "ghostsurf_snapshot",
+      "description": "Get a snapshot of the current browser state (active profile, all tabs, active tab index)",
+      "endpoint": "GET /snapshot"
+    },
+    {
+      "name": "ghostsurf_navigate",
+      "description": "Navigate the current or specified tab to a URL",
+      "endpoint": "POST /navigate",
+      "parameters": {
+        "url": { "type": "string", "required": true, "description": "URL to navigate to" },
+        "tab_index": { "type": "number", "required": false, "description": "Tab index to navigate (default: current)" }
+      }
+    },
+    {
+      "name": "ghostsurf_create_tab",
+      "description": "Open a new browser tab, optionally with a specific URL",
+      "endpoint": "POST /tabs",
+      "parameters": {
+        "url": { "type": "string", "required": false, "description": "URL to open in the new tab" }
+      }
+    },
+    {
+      "name": "ghostsurf_close_tab",
+      "description": "Close a browser tab by index",
+      "endpoint": "POST /tabs/close",
+      "parameters": {
+        "index": { "type": "number", "required": true, "description": "Index of the tab to close" }
+      }
+    },
+    {
+      "name": "ghostsurf_switch_profile",
+      "description": "Switch to a different browser profile (changes proxy, user agent, cookies, storage)",
+      "endpoint": "POST /profiles/switch",
+      "parameters": {
+        "profile_id": { "type": "string", "required": true, "description": "ID of the profile to switch to" }
+      }
+    },
+    {
+      "name": "ghostsurf_create_profile",
+      "description": "Create a new browser profile with custom settings",
+      "endpoint": "POST /profiles",
+      "parameters": {
+        "id": { "type": "string", "required": true, "description": "Unique profile ID (lowercase, no spaces)" },
+        "config": {
+          "type": "object",
+          "required": true,
+          "description": "Profile configuration",
+          "properties": {
+            "name": { "type": "string" },
+            "color": { "type": "string" },
+            "homepage": { "type": "string" },
+            "user_agent": { "type": "string" },
+            "notes": { "type": "string" },
+            "proxy": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "type": { "type": "string", "enum": ["http", "socks5"] },
+                "host": { "type": "string" },
+                "port": { "type": "number" },
+                "username": { "type": "string" },
+                "password": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "ghostsurf_delete_profile",
+      "description": "Delete a browser profile by ID",
+      "endpoint": "DELETE /profiles/{profile_id}"
+    }
+  ]
+}
