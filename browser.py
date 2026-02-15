@@ -923,108 +923,100 @@ class BrowserTab(QWidget):
         return self.web_view.title()
 
 
-# ─── Main Browser Window ────────────────────────────────────────────────────
+# ─── Profile Browser Window ─────────────────────────────────────────────────
 
-class GhostSurfBrowser(QMainWindow):
-    """Main browser window with multi-profile support."""
+class ProfileWindow(QMainWindow):
+    """A browser window bound to a single profile. Each window has its own
+    proxy relay so there is zero cross-profile leakage."""
 
-    def __init__(self, proxy_relay):
+    window_closed = pyqtSignal(str)  # emits profile_id on close
+
+    def __init__(self, profile_id, profile_config, profile_manager, relay_port, relay=None):
         super().__init__()
-        self.proxy_relay = proxy_relay
-        self.profile_manager = ProfileManager()
-        self.current_profile_id = "default"
-        self.qt_profiles = {}  # profile_id -> QWebEngineProfile
-        self.tabs = []  # list of BrowserTab
-        self.api_server = None
+        self.profile_id = profile_id
+        self.profile_config = profile_config
+        self.profile_manager = profile_manager
+        self.qt_profile = None
+        self.tabs = []
+
+        # Use provided relay or create a new one
+        if relay is not None:
+            self.proxy_relay = relay
+        else:
+            self.proxy_relay = ProxyRelay(relay_port)
+            self.proxy_relay.start()
+        self._apply_proxy(profile_config.get("proxy", {}))
 
         self._setup_ui()
         self._setup_shortcuts()
-        self._switch_profile("default")
         self._new_tab()
 
-        # Start API server
-        self._start_api_server()
-
     def _setup_ui(self):
-        self.setWindowTitle(f"{APP_NAME} - Privacy Browser")
+        name = self.profile_config.get("name", self.profile_id)
+        color = self.profile_config.get("color", "#e94560")
+        notes = self.profile_config.get("notes", "")
+        title = f"{APP_NAME} — {name}"
+        if notes:
+            title += f" ({notes})"
+        self.setWindowTitle(title)
         self.resize(1400, 900)
 
-        # Central widget
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # ── Top toolbar ──
+        # Toolbar
         toolbar = QToolBar()
         toolbar.setMovable(False)
         toolbar.setIconSize(QSize(18, 18))
         self.addToolBar(toolbar)
 
-        # Profile selector
-        self.profile_combo = QComboBox()
-        self.profile_combo.setMinimumWidth(180)
-        self._refresh_profile_combo()
-        self.profile_combo.currentIndexChanged.connect(self._on_profile_changed)
-        toolbar.addWidget(QLabel("  Profile: "))
-        toolbar.addWidget(self.profile_combo)
+        # Profile badge
+        badge = QLabel(f"  {name}  ")
+        badge.setStyleSheet(f"background: {color}; color: #fff; border-radius: 4px; padding: 4px 8px; font-weight: bold;")
+        toolbar.addWidget(badge)
         toolbar.addSeparator()
 
-        # Navigation buttons
-        self.back_btn = QPushButton("<")
-        self.back_btn.setFixedSize(32, 32)
-        self.back_btn.setToolTip("Back")
-        self.back_btn.clicked.connect(self._go_back)
-        toolbar.addWidget(self.back_btn)
+        # Navigation
+        back_btn = QPushButton("<")
+        back_btn.setFixedSize(32, 32)
+        back_btn.clicked.connect(self._go_back)
+        toolbar.addWidget(back_btn)
 
-        self.fwd_btn = QPushButton(">")
-        self.fwd_btn.setFixedSize(32, 32)
-        self.fwd_btn.setToolTip("Forward")
-        self.fwd_btn.clicked.connect(self._go_forward)
-        toolbar.addWidget(self.fwd_btn)
+        fwd_btn = QPushButton(">")
+        fwd_btn.setFixedSize(32, 32)
+        fwd_btn.clicked.connect(self._go_forward)
+        toolbar.addWidget(fwd_btn)
 
-        self.reload_btn = QPushButton("R")
-        self.reload_btn.setFixedSize(32, 32)
-        self.reload_btn.setToolTip("Reload")
-        self.reload_btn.clicked.connect(self._reload)
-        toolbar.addWidget(self.reload_btn)
+        reload_btn = QPushButton("R")
+        reload_btn.setFixedSize(32, 32)
+        reload_btn.clicked.connect(self._reload)
+        toolbar.addWidget(reload_btn)
 
-        # URL bar
         self.url_bar = QLineEdit()
         self.url_bar.setPlaceholderText("Enter URL or search...")
         self.url_bar.returnPressed.connect(self._navigate)
         toolbar.addWidget(self.url_bar)
 
-        # Action buttons
-        self.new_tab_btn = QPushButton("+")
-        self.new_tab_btn.setFixedSize(32, 32)
-        self.new_tab_btn.setToolTip("New Tab (Cmd+T)")
-        self.new_tab_btn.clicked.connect(self._new_tab)
-        toolbar.addWidget(self.new_tab_btn)
+        new_tab_btn = QPushButton("+")
+        new_tab_btn.setFixedSize(32, 32)
+        new_tab_btn.setToolTip("New Tab")
+        new_tab_btn.clicked.connect(self._new_tab)
+        toolbar.addWidget(new_tab_btn)
 
-        # Reddit quick-nav
-        self.reddit_btn = QPushButton("Reddit")
-        self.reddit_btn.setToolTip("Go to Reddit")
-        self.reddit_btn.clicked.connect(lambda: self._quick_nav("https://www.reddit.com"))
-        toolbar.addWidget(self.reddit_btn)
+        reddit_btn = QPushButton("Reddit")
+        reddit_btn.clicked.connect(lambda: self._quick_nav("https://www.reddit.com"))
+        toolbar.addWidget(reddit_btn)
 
         toolbar.addSeparator()
 
-        # Profile management button
-        self.manage_btn = QPushButton("Profiles")
-        self.manage_btn.setToolTip("Manage Profiles")
-        self.manage_btn.clicked.connect(self._show_profile_manager)
-        toolbar.addWidget(self.manage_btn)
+        clear_btn = QPushButton("Clear Data")
+        clear_btn.clicked.connect(self._clear_profile_data)
+        toolbar.addWidget(clear_btn)
 
-        # Menu button
-        self.menu_btn = QPushButton("=")
-        self.menu_btn.setFixedSize(32, 32)
-        self.menu_btn.setToolTip("Menu")
-        self.menu_btn.clicked.connect(self._show_menu)
-        toolbar.addWidget(self.menu_btn)
-
-        # ── Tab widget ──
+        # Tabs
         self.tab_widget = QTabWidget()
         self.tab_widget.setTabsClosable(True)
         self.tab_widget.setMovable(True)
@@ -1032,101 +1024,50 @@ class GhostSurfBrowser(QMainWindow):
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
         main_layout.addWidget(self.tab_widget)
 
-        # ── Status bar ──
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self.profile_label = QLabel()
-        self.proxy_label = QLabel()
-        self.api_label = QLabel()
-        self.status_bar.addPermanentWidget(self.profile_label)
-        self.status_bar.addPermanentWidget(self.proxy_label)
-        self.status_bar.addPermanentWidget(self.api_label)
-        self._update_status_bar()
+        # Status bar
+        status_bar = QStatusBar()
+        self.setStatusBar(status_bar)
+        proxy = self.profile_config.get("proxy", {})
+        if proxy.get("enabled"):
+            proxy_label = QLabel(f"  Proxy: {proxy['type'].upper()} {proxy['host']}:{proxy['port']}  ")
+            proxy_label.setStyleSheet("color: #4ecca3;")
+        else:
+            proxy_label = QLabel("  Proxy: DIRECT  ")
+            proxy_label.setStyleSheet("color: #666;")
+        status_bar.addPermanentWidget(proxy_label)
+
+        # Color the tab bar
+        self.setStyleSheet(self.styleSheet() + f"""
+        QTabBar::tab:selected {{ border-bottom: 2px solid {color}; color: {color}; }}
+        """)
 
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+T"), self, self._new_tab)
         QShortcut(QKeySequence("Ctrl+W"), self, self._close_current_tab)
         QShortcut(QKeySequence("Ctrl+L"), self, lambda: self.url_bar.setFocus())
         QShortcut(QKeySequence("Ctrl+R"), self, self._reload)
-        QShortcut(QKeySequence("Ctrl+Shift+N"), self, self._new_incognito_tab)
-        # Cmd variants for macOS
         QShortcut(QKeySequence("Meta+T"), self, self._new_tab)
         QShortcut(QKeySequence("Meta+W"), self, self._close_current_tab)
         QShortcut(QKeySequence("Meta+L"), self, lambda: self.url_bar.setFocus())
         QShortcut(QKeySequence("Meta+R"), self, self._reload)
 
-    def _refresh_profile_combo(self):
-        self.profile_combo.blockSignals(True)
-        self.profile_combo.clear()
-        for pid, pdata in self.profile_manager.list_profiles().items():
-            label = f"{pdata['name']}"
-            if pdata.get("notes"):
-                label += f" ({pdata['notes']})"
-            self.profile_combo.addItem(label, pid)
-        # Select current
-        idx = self.profile_combo.findData(self.current_profile_id)
-        if idx >= 0:
-            self.profile_combo.setCurrentIndex(idx)
-        self.profile_combo.blockSignals(False)
-
-    def _on_profile_changed(self, index):
-        pid = self.profile_combo.itemData(index)
-        if pid and pid != self.current_profile_id:
-            self._switch_profile(pid)
-
-    def _get_qt_profile(self, profile_id):
-        """Get or create an isolated QWebEngineProfile for the given profile."""
-        if profile_id not in self.qt_profiles:
-            storage_path = self.profile_manager.get_storage_path(profile_id)
-            qt_profile = QWebEngineProfile(profile_id, self)
-            qt_profile.setPersistentStoragePath(storage_path)
-            qt_profile.setCachePath(os.path.join(storage_path, "cache"))
-            qt_profile.setPersistentCookiesPolicy(
+    def _get_qt_profile(self):
+        if self.qt_profile is None:
+            storage_path = self.profile_manager.get_storage_path(self.profile_id)
+            self.qt_profile = QWebEngineProfile(self.profile_id, self)
+            self.qt_profile.setPersistentStoragePath(storage_path)
+            self.qt_profile.setCachePath(os.path.join(storage_path, "cache"))
+            self.qt_profile.setPersistentCookiesPolicy(
                 QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies
             )
-
-            profile_config = self.profile_manager.get_profile(profile_id)
-            if profile_config:
-                ua = profile_config.get("user_agent", DEFAULT_USER_AGENTS[0])
-                qt_profile.setHttpUserAgent(ua)
-
-            self.qt_profiles[profile_id] = qt_profile
-
-        return self.qt_profiles[profile_id]
-
-    def _switch_profile(self, profile_id):
-        """Switch active profile - applies proxy, updates UI."""
-        self.current_profile_id = profile_id
-        profile_config = self.profile_manager.get_profile(profile_id)
-        if not profile_config:
-            return
-
-        # Apply proxy
-        self._apply_proxy(profile_config.get("proxy", {}))
-
-        # Update UI color accent
-        color = profile_config.get("color", "#e94560")
-        self._update_accent_color(color)
-        self._update_status_bar()
-
-        # Update combo selection
-        idx = self.profile_combo.findData(profile_id)
-        if idx >= 0:
-            self.profile_combo.blockSignals(True)
-            self.profile_combo.setCurrentIndex(idx)
-            self.profile_combo.blockSignals(False)
+            ua = self.profile_config.get("user_agent", DEFAULT_USER_AGENTS[0])
+            self.qt_profile.setHttpUserAgent(ua)
+        return self.qt_profile
 
     def _apply_proxy(self, proxy_config):
-        """Apply proxy by updating the local relay's upstream target.
-
-        QtWebEngine/Chromium ignores QNetworkProxy entirely. Instead,
-        Chromium is started with --proxy-server=http://127.0.0.1:LOCAL_PROXY_PORT
-        and we dynamically swap the upstream that the local relay forwards to.
-        """
         if not proxy_config.get("enabled"):
             self.proxy_relay.clear_upstream()
             return
-
         self.proxy_relay.set_upstream(
             proxy_config.get("host", ""),
             proxy_config.get("port", 0),
@@ -1135,87 +1076,23 @@ class GhostSurfBrowser(QMainWindow):
             proxy_config.get("password", ""),
         )
 
-    def _update_accent_color(self, color):
-        """Update the tab bar accent color to match profile."""
-        accent_style = f"""
-        QTabBar::tab:selected {{
-            border-bottom: 2px solid {color};
-            color: {color};
-        }}
-        QGroupBox {{
-            color: {color};
-        }}
-        """
-        # Apply on top of dark theme
-        current = self.styleSheet()
-        # Remove old accent overrides
-        if hasattr(self, '_accent_style'):
-            current = current.replace(self._accent_style, '')
-        self._accent_style = accent_style
-        self.setStyleSheet(current + accent_style)
-
-    def _update_status_bar(self):
-        profile = self.profile_manager.get_profile(self.current_profile_id)
-        if not profile:
-            return
-
-        self.profile_label.setText(f"  Profile: {profile['name']}  ")
-
-        proxy = profile.get("proxy", {})
-        if proxy.get("enabled"):
-            self.proxy_label.setText(f"  Proxy: {proxy['type'].upper()} {proxy['host']}:{proxy['port']}  ")
-            self.proxy_label.setStyleSheet("color: #4ecca3;")
-        else:
-            self.proxy_label.setText("  Proxy: OFF  ")
-            self.proxy_label.setStyleSheet("color: #666;")
-
-        if self.api_server:
-            self.api_label.setText(f"  API: :{API_DEFAULT_PORT}  ")
-            self.api_label.setStyleSheet("color: #4ecca3;")
-        else:
-            self.api_label.setText("  API: OFF  ")
-
-    # ── Tab Management ──
+    # ── Tabs ──
 
     def _new_tab(self, url=None):
-        profile_config = self.profile_manager.get_profile(self.current_profile_id)
-        qt_profile = self._get_qt_profile(self.current_profile_id)
-
+        qt_profile = self._get_qt_profile()
         if url is None:
-            url = profile_config.get("homepage", "https://www.reddit.com") if profile_config else "https://www.reddit.com"
-
-        privacy_config = profile_config.get("privacy", {}) if profile_config else {}
-        user_agent = profile_config.get("user_agent", DEFAULT_USER_AGENTS[0]) if profile_config else DEFAULT_USER_AGENTS[0]
+            url = self.profile_config.get("homepage", "https://www.reddit.com")
+        privacy = self.profile_config.get("privacy", {})
+        ua = self.profile_config.get("user_agent", DEFAULT_USER_AGENTS[0])
 
         tab_index = self.tab_widget.count()
-        tab = BrowserTab(tab_index, qt_profile, privacy_config, user_agent, url)
+        tab = BrowserTab(tab_index, qt_profile, privacy, ua, url)
         tab.title_changed.connect(self._on_title_changed)
         tab.url_changed.connect(self._on_url_changed)
-
         self.tabs.append(tab)
         idx = self.tab_widget.addTab(tab, "Loading...")
         self.tab_widget.setCurrentIndex(idx)
-
         return idx
-
-    def _new_incognito_tab(self):
-        """Open a tab with a fresh off-the-record profile."""
-        profile_config = self.profile_manager.get_profile(self.current_profile_id)
-        otr_profile = QWebEngineProfile(self)  # off-the-record (no storage path)
-
-        privacy_config = profile_config.get("privacy", {}) if profile_config else {}
-        user_agent = profile_config.get("user_agent", DEFAULT_USER_AGENTS[0]) if profile_config else DEFAULT_USER_AGENTS[0]
-        otr_profile.setHttpUserAgent(user_agent)
-
-        url = "https://www.reddit.com"
-        tab_index = self.tab_widget.count()
-        tab = BrowserTab(tab_index, otr_profile, privacy_config, user_agent, url)
-        tab.title_changed.connect(self._on_title_changed)
-        tab.url_changed.connect(self._on_url_changed)
-
-        self.tabs.append(tab)
-        idx = self.tab_widget.addTab(tab, "[Private] Loading...")
-        self.tab_widget.setCurrentIndex(idx)
 
     def _close_tab(self, index):
         if self.tab_widget.count() > 1:
@@ -1224,7 +1101,6 @@ class GhostSurfBrowser(QMainWindow):
             if widget in self.tabs:
                 self.tabs.remove(widget)
             widget.deleteLater()
-            # Reindex remaining tabs
             for i, tab in enumerate(self.tabs):
                 tab.tab_index = i
 
@@ -1237,12 +1113,11 @@ class GhostSurfBrowser(QMainWindow):
             self.url_bar.setText(widget.current_url())
 
     def _on_title_changed(self, tab_index, title):
-        # Find the tab in tab widget
         for i in range(self.tab_widget.count()):
             widget = self.tab_widget.widget(i)
             if hasattr(widget, 'tab_index') and widget.tab_index == tab_index:
-                short_title = title[:30] + "..." if len(title) > 30 else title
-                self.tab_widget.setTabText(i, short_title)
+                short = title[:30] + "..." if len(title) > 30 else title
+                self.tab_widget.setTabText(i, short)
                 break
 
     def _on_url_changed(self, tab_index, url):
@@ -1256,172 +1131,200 @@ class GhostSurfBrowser(QMainWindow):
         url = self.url_bar.text().strip()
         if not url:
             return
-
-        # Check if it's a search query
         if " " in url or ("." not in url and "/" not in url):
             url = f"https://duckduckgo.com/?q={url}"
         elif not url.startswith(("http://", "https://")):
             url = "https://" + url
-
         current = self.tab_widget.currentWidget()
         if current and hasattr(current, 'navigate'):
             current.navigate(url)
 
     def _go_back(self):
-        current = self.tab_widget.currentWidget()
-        if current and hasattr(current, 'web_view'):
-            current.web_view.back()
+        w = self.tab_widget.currentWidget()
+        if w and hasattr(w, 'web_view'):
+            w.web_view.back()
 
     def _go_forward(self):
-        current = self.tab_widget.currentWidget()
-        if current and hasattr(current, 'web_view'):
-            current.web_view.forward()
+        w = self.tab_widget.currentWidget()
+        if w and hasattr(w, 'web_view'):
+            w.web_view.forward()
 
     def _reload(self):
-        current = self.tab_widget.currentWidget()
-        if current and hasattr(current, 'web_view'):
-            current.web_view.reload()
+        w = self.tab_widget.currentWidget()
+        if w and hasattr(w, 'web_view'):
+            w.web_view.reload()
 
     def _quick_nav(self, url):
-        current = self.tab_widget.currentWidget()
-        if current and hasattr(current, 'navigate'):
-            current.navigate(url)
+        w = self.tab_widget.currentWidget()
+        if w and hasattr(w, 'navigate'):
+            w.navigate(url)
             self.url_bar.setText(url)
-
-    # ── Menus ──
-
-    def _show_menu(self):
-        menu = QMenu(self)
-
-        new_tab = menu.addAction("New Tab")
-        new_tab.triggered.connect(self._new_tab)
-
-        private_tab = menu.addAction("New Private Tab")
-        private_tab.triggered.connect(self._new_incognito_tab)
-
-        menu.addSeparator()
-
-        # Quick profile switcher
-        profiles_menu = menu.addMenu("Switch Profile")
-        for pid, pdata in self.profile_manager.list_profiles().items():
-            label = pdata["name"]
-            if pdata.get("notes"):
-                label += f" ({pdata['notes']})"
-            if pid == self.current_profile_id:
-                label += " *"
-            action = profiles_menu.addAction(label)
-            action.triggered.connect(partial(self._switch_profile_and_update, pid))
-
-        menu.addSeparator()
-
-        manage = menu.addAction("Manage Profiles...")
-        manage.triggered.connect(self._show_profile_manager)
-
-        clear_data = menu.addAction("Clear Profile Data")
-        clear_data.triggered.connect(self._clear_profile_data)
-
-        menu.addSeparator()
-
-        reddit_home = menu.addAction("Reddit Home")
-        reddit_home.triggered.connect(lambda: self._quick_nav("https://www.reddit.com"))
-
-        reddit_new = menu.addAction("Reddit (new.reddit)")
-        reddit_new.triggered.connect(lambda: self._quick_nav("https://new.reddit.com"))
-
-        reddit_old = menu.addAction("Reddit (old.reddit)")
-        reddit_old.triggered.connect(lambda: self._quick_nav("https://old.reddit.com"))
-
-        menu.addSeparator()
-
-        about = menu.addAction("About GhostSurf")
-        about.triggered.connect(self._show_about)
-
-        menu.exec(self.menu_btn.mapToGlobal(self.menu_btn.rect().bottomLeft()))
-
-    def _switch_profile_and_update(self, profile_id):
-        self._switch_profile(profile_id)
-        self._refresh_profile_combo()
-        # Open homepage in new tab
-        self._new_tab()
-
-    def _show_about(self):
-        QMessageBox.about(
-            self, f"About {APP_NAME}",
-            f"<h2>{APP_NAME} v{APP_VERSION}</h2>"
-            f"<p>Privacy browser with multi-profile support.</p>"
-            f"<p>Features:</p>"
-            f"<ul>"
-            f"<li>Isolated profiles with separate cookies/storage</li>"
-            f"<li>Per-profile proxy (HTTP/SOCKS5)</li>"
-            f"<li>WebRTC blocking, canvas/WebGL spoofing</li>"
-            f"<li>REST API for OpenClaw integration</li>"
-            f"<li>DuckDuckGo default search</li>"
-            f"</ul>"
-            f"<p>API running on port {API_DEFAULT_PORT}</p>"
-        )
 
     def _clear_profile_data(self):
         reply = QMessageBox.question(
             self, "Clear Profile Data",
-            f"Clear all browsing data for profile '{self.current_profile_id}'?\n"
-            "This will delete cookies, cache, and local storage.",
+            f"Clear all cookies, cache, and storage for this profile?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-        if reply == QMessageBox.StandardButton.Yes:
-            qt_profile = self.qt_profiles.get(self.current_profile_id)
-            if qt_profile:
-                qt_profile.clearAllVisitedLinks()
-                qt_profile.clearHttpCache()
-                cookie_store = qt_profile.cookieStore()
-                cookie_store.deleteAllCookies()
-                self.status_bar.showMessage("Profile data cleared.", 3000)
+        if reply == QMessageBox.StandardButton.Yes and self.qt_profile:
+            self.qt_profile.clearAllVisitedLinks()
+            self.qt_profile.clearHttpCache()
+            self.qt_profile.cookieStore().deleteAllCookies()
+            self.statusBar().showMessage("Profile data cleared.", 3000)
 
-    # ── Profile Manager Dialog ──
+    def get_tabs_info(self):
+        result = []
+        for i in range(self.tab_widget.count()):
+            widget = self.tab_widget.widget(i)
+            if hasattr(widget, 'current_url'):
+                result.append({"index": i, "url": widget.current_url(), "title": widget.current_title()})
+        return result
 
-    def _show_profile_manager(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Profile Manager")
-        dialog.setMinimumSize(600, 500)
+    def closeEvent(self, event):
+        self.proxy_relay.stop()
+        self.window_closed.emit(self.profile_id)
+        super().closeEvent(event)
 
-        layout = QVBoxLayout(dialog)
+
+# ─── Launcher Window ────────────────────────────────────────────────────────
+
+class GhostSurfLauncher(QMainWindow):
+    """Launcher that opens separate browser windows per profile."""
+
+    _open_profile_signal = pyqtSignal(str)
+    _refresh_signal = pyqtSignal()
+    _window_closed_signal = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.profile_manager = ProfileManager()
+        self.open_windows = {}  # profile_id -> subprocess.Popen
+        self._next_relay_port = LOCAL_PROXY_PORT
+        self.api_server = None
+
+        # Connect signals for thread-safe calls from API handler
+        self._open_profile_signal.connect(self._open_profile)
+        self._refresh_signal.connect(self._refresh_list)
+        self._window_closed_signal.connect(self._on_window_closed)
+
+        self._setup_ui()
+        self._start_api_server()
+
+    def _alloc_relay_port(self):
+        port = self._next_relay_port
+        self._next_relay_port += 1
+        return port
+
+    def _setup_ui(self):
+        self.setWindowTitle(f"{APP_NAME} — Profile Launcher")
+        self.setFixedSize(500, 600)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        title = QLabel(f"{APP_NAME}")
+        title.setStyleSheet("font-size: 24px; font-weight: bold; color: #e94560;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        subtitle = QLabel("Select a profile to open in its own isolated window")
+        subtitle.setStyleSheet("color: #888; margin-bottom: 12px;")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(subtitle)
 
         # Profile list
         self.profile_list = QListWidget()
-        self._refresh_profile_list()
+        self.profile_list.setStyleSheet("QListWidget::item { padding: 12px; }")
+        self.profile_list.itemDoubleClicked.connect(self._on_profile_double_clicked)
+        self._refresh_list()
         layout.addWidget(self.profile_list)
 
         # Buttons
         btn_layout = QHBoxLayout()
 
-        add_btn = QPushButton("+ New Profile")
-        add_btn.clicked.connect(lambda: self._add_profile(dialog))
-        btn_layout.addWidget(add_btn)
+        open_btn = QPushButton("Open Window")
+        open_btn.setStyleSheet("background: #e94560; font-weight: bold; padding: 10px 20px;")
+        open_btn.clicked.connect(self._open_selected)
+        btn_layout.addWidget(open_btn)
 
-        edit_btn = QPushButton("Edit")
-        edit_btn.clicked.connect(lambda: self._edit_profile(dialog))
-        btn_layout.addWidget(edit_btn)
-
-        delete_btn = QPushButton("Delete")
-        delete_btn.clicked.connect(lambda: self._delete_profile(dialog))
-        btn_layout.addWidget(delete_btn)
-
-        duplicate_btn = QPushButton("Duplicate")
-        duplicate_btn.clicked.connect(lambda: self._duplicate_profile(dialog))
-        btn_layout.addWidget(duplicate_btn)
-
-        btn_layout.addStretch()
-
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dialog.accept)
-        btn_layout.addWidget(close_btn)
+        manage_btn = QPushButton("Manage")
+        manage_btn.clicked.connect(self._show_profile_manager)
+        btn_layout.addWidget(manage_btn)
 
         layout.addLayout(btn_layout)
 
-        dialog.exec()
-        self._refresh_profile_combo()
+        # Status
+        self.status_label = QLabel(f"API: http://127.0.0.1:{API_DEFAULT_PORT}")
+        self.status_label.setStyleSheet("color: #4ecca3; margin-top: 8px;")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.status_label)
 
-    def _refresh_profile_list(self):
+    def _refresh_list(self):
         self.profile_list.clear()
+        for pid, pdata in self.profile_manager.list_profiles().items():
+            label = f"{pdata['name']}"
+            if pdata.get("notes"):
+                label += f"  —  {pdata['notes']}"
+            proxy = pdata.get("proxy", {})
+            if proxy.get("enabled"):
+                label += f"  |  {proxy['host']}:{proxy['port']}"
+            if pid in self.open_windows:
+                label += "  [OPEN]"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, pid)
+            self.profile_list.addItem(item)
+
+    def _on_profile_double_clicked(self, item):
+        self._open_profile(item.data(Qt.ItemDataRole.UserRole))
+
+    def _open_selected(self):
+        item = self.profile_list.currentItem()
+        if item:
+            self._open_profile(item.data(Qt.ItemDataRole.UserRole))
+
+    def _open_profile(self, profile_id):
+        if profile_id in self.open_windows:
+            # Check if process is still running
+            proc = self.open_windows[profile_id]
+            if proc.poll() is None:
+                return  # still running
+            else:
+                del self.open_windows[profile_id]
+
+        config = self.profile_manager.get_profile(profile_id)
+        if not config:
+            return
+
+        port = self._alloc_relay_port()
+        import subprocess as sp
+        proc = sp.Popen([
+            sys.executable, __file__,
+            "--profile", profile_id,
+            "--relay-port", str(port),
+        ])
+        self.open_windows[profile_id] = proc
+        self._refresh_list()
+
+        # Monitor for exit in background thread
+        def watch():
+            proc.wait()
+            self._window_closed_signal.emit(profile_id)
+        threading.Thread(target=watch, daemon=True).start()
+
+    def _on_window_closed(self, profile_id):
+        if profile_id in self.open_windows:
+            del self.open_windows[profile_id]
+        self._refresh_list()
+
+    def _show_profile_manager(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Profile Manager")
+        dialog.setMinimumSize(600, 500)
+        layout = QVBoxLayout(dialog)
+
+        plist = QListWidget()
         for pid, pdata in self.profile_manager.list_profiles().items():
             label = f"{pdata['name']} [{pid}]"
             if pdata.get("notes"):
@@ -1429,106 +1332,98 @@ class GhostSurfBrowser(QMainWindow):
             proxy = pdata.get("proxy", {})
             if proxy.get("enabled"):
                 label += f" | Proxy: {proxy['type']}://{proxy['host']}:{proxy['port']}"
-            if pid == self.current_profile_id:
-                label += " (active)"
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, pid)
-            self.profile_list.addItem(item)
+            plist.addItem(item)
+        layout.addWidget(plist)
 
-    def _add_profile(self, parent_dialog):
-        dialog = ProfileDialog(parent_dialog)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            data = dialog.get_data()
-            pid = data["id"]
-            if not pid:
-                QMessageBox.warning(parent_dialog, "Error", "Profile ID is required.")
+        btn_layout = QHBoxLayout()
+
+        def add_profile():
+            d = ProfileDialog(dialog)
+            if d.exec() == QDialog.DialogCode.Accepted:
+                data = d.get_data()
+                pid = data["id"]
+                if pid and pid not in self.profile_manager.profiles:
+                    self.profile_manager.create_profile(pid, data["config"])
+                    plist.addItem(f"{data['config']['name']} [{pid}]")
+                    self._refresh_list()
+
+        def edit_profile():
+            item = plist.currentItem()
+            if not item:
                 return
-            if pid in self.profile_manager.profiles:
-                QMessageBox.warning(parent_dialog, "Error", f"Profile '{pid}' already exists.")
+            pid = item.data(Qt.ItemDataRole.UserRole)
+            pdata = self.profile_manager.get_profile(pid)
+            d = ProfileDialog(dialog, profile_data=pdata, profile_id=pid)
+            if d.exec() == QDialog.DialogCode.Accepted:
+                data = d.get_data()
+                self.profile_manager.update_profile(pid, data["config"])
+                self._refresh_list()
+                dialog.accept()
+                self._show_profile_manager()
+
+        def delete_profile():
+            item = plist.currentItem()
+            if not item:
                 return
-            self.profile_manager.create_profile(pid, data["config"])
-            self._refresh_profile_list()
+            pid = item.data(Qt.ItemDataRole.UserRole)
+            if pid == "default":
+                return
+            if pid in self.open_windows:
+                QMessageBox.warning(dialog, "Error", "Close the window first.")
+                return
+            reply = QMessageBox.question(dialog, "Delete", f"Delete '{pid}'?",
+                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.profile_manager.delete_profile(pid)
+                self._refresh_list()
+                dialog.accept()
+                self._show_profile_manager()
 
-    def _edit_profile(self, parent_dialog):
-        item = self.profile_list.currentItem()
-        if not item:
-            return
-        pid = item.data(Qt.ItemDataRole.UserRole)
-        pdata = self.profile_manager.get_profile(pid)
-        dialog = ProfileDialog(parent_dialog, profile_data=pdata, profile_id=pid)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            data = dialog.get_data()
-            self.profile_manager.update_profile(pid, data["config"])
-            self._refresh_profile_list()
-            if pid == self.current_profile_id:
-                self._switch_profile(pid)
+        add_btn = QPushButton("+ New")
+        add_btn.clicked.connect(add_profile)
+        btn_layout.addWidget(add_btn)
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(edit_profile)
+        btn_layout.addWidget(edit_btn)
+        del_btn = QPushButton("Delete")
+        del_btn.clicked.connect(delete_profile)
+        btn_layout.addWidget(del_btn)
+        btn_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
 
-    def _delete_profile(self, parent_dialog):
-        item = self.profile_list.currentItem()
-        if not item:
-            return
-        pid = item.data(Qt.ItemDataRole.UserRole)
-        if pid == "default":
-            QMessageBox.warning(parent_dialog, "Error", "Cannot delete the default profile.")
-            return
-        reply = QMessageBox.question(
-            parent_dialog, "Delete Profile",
-            f"Delete profile '{pid}'? This cannot be undone.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            if pid == self.current_profile_id:
-                self._switch_profile("default")
-            self.profile_manager.delete_profile(pid)
-            self._refresh_profile_list()
-
-    def _duplicate_profile(self, parent_dialog):
-        item = self.profile_list.currentItem()
-        if not item:
-            return
-        pid = item.data(Qt.ItemDataRole.UserRole)
-        pdata = self.profile_manager.get_profile(pid)
-        if pdata:
-            import copy
-            new_data = copy.deepcopy(pdata)
-            new_id = f"{pid}-copy"
-            counter = 1
-            while new_id in self.profile_manager.profiles:
-                new_id = f"{pid}-copy-{counter}"
-                counter += 1
-            new_data["name"] = f"{new_data['name']} (Copy)"
-            self.profile_manager.create_profile(new_id, new_data)
-            self._refresh_profile_list()
+        dialog.exec()
+        self._refresh_list()
 
     # ── API Server ──
 
     def _start_api_server(self):
-        """Start the REST API server for OpenClaw integration."""
         handler = partial(APIHandler, self)
         try:
             self.api_server = HTTPServer(("127.0.0.1", API_DEFAULT_PORT), handler)
-            thread = threading.Thread(target=self.api_server.serve_forever, daemon=True)
-            thread.start()
-            self._update_status_bar()
-            print(f"[GhostSurf] API server started on http://127.0.0.1:{API_DEFAULT_PORT}")
+            threading.Thread(target=self.api_server.serve_forever, daemon=True).start()
+            print(f"[GhostSurf] API server on http://127.0.0.1:{API_DEFAULT_PORT}")
         except OSError as e:
-            print(f"[GhostSurf] API server failed to start: {e}")
-            self.api_server = None
+            print(f"[GhostSurf] API failed: {e}")
 
     def closeEvent(self, event):
+        for proc in list(self.open_windows.values()):
+            if proc.poll() is None:
+                proc.terminate()
         if self.api_server:
             self.api_server.shutdown()
-        self.proxy_relay.stop()
         super().closeEvent(event)
 
-    # ── API Methods (called from API handler) ──
+    # ── API Methods ──
 
     def api_get_status(self):
         return {
-            "app": APP_NAME,
-            "version": APP_VERSION,
-            "active_profile": self.current_profile_id,
-            "tabs": self.tab_widget.count(),
+            "app": APP_NAME, "version": APP_VERSION,
+            "open_windows": list(self.open_windows.keys()),
             "profiles": list(self.profile_manager.profiles.keys()),
         }
 
@@ -1536,67 +1431,33 @@ class GhostSurfBrowser(QMainWindow):
         return self.profile_manager.list_profiles()
 
     def api_get_tabs(self):
-        result = []
-        for i in range(self.tab_widget.count()):
-            widget = self.tab_widget.widget(i)
-            if hasattr(widget, 'current_url'):
-                result.append({
-                    "index": i,
-                    "url": widget.current_url(),
-                    "title": widget.current_title(),
-                })
-        return result
+        # Tabs are in separate processes; return which profiles are open
+        return {pid: "running" for pid, proc in self.open_windows.items() if proc.poll() is None}
 
     def api_navigate(self, url, tab_index=None):
-        """Navigate a tab to a URL. Thread-safe via signal."""
-        QTimer.singleShot(0, lambda: self._api_navigate_impl(url, tab_index))
-        return {"status": "ok", "url": url}
-
-    def _api_navigate_impl(self, url, tab_index):
-        if tab_index is not None and 0 <= tab_index < self.tab_widget.count():
-            widget = self.tab_widget.widget(tab_index)
-        else:
-            widget = self.tab_widget.currentWidget()
-        if widget and hasattr(widget, 'navigate'):
-            if not url.startswith(("http://", "https://")):
-                url = "https://" + url
-            widget.navigate(url)
-            self.url_bar.setText(url)
+        return {"status": "ok", "note": "Navigate via profile window directly", "url": url}
 
     def api_new_tab(self, url=None):
-        result = {"status": "ok"}
-        QTimer.singleShot(0, lambda: self._api_new_tab_impl(url))
-        return result
-
-    def _api_new_tab_impl(self, url):
-        self._new_tab(url)
+        return {"status": "ok", "note": "Tabs managed per profile window"}
 
     def api_close_tab(self, index):
-        QTimer.singleShot(0, lambda: self._close_tab(index))
-        return {"status": "ok"}
+        return {"status": "ok", "note": "Tabs managed per profile window"}
 
     def api_switch_profile(self, profile_id):
         if profile_id not in self.profile_manager.profiles:
             return {"error": f"Profile '{profile_id}' not found"}
-        QTimer.singleShot(0, lambda: self._switch_profile_and_update(profile_id))
+        self._open_profile_signal.emit(profile_id)
         return {"status": "ok", "profile": profile_id}
 
     def api_create_profile(self, profile_id, config):
         self.profile_manager.create_profile(profile_id, config)
-        QTimer.singleShot(0, self._refresh_profile_combo)
+        self._refresh_signal.emit()
         return {"status": "ok", "profile": profile_id}
 
-    def api_get_page_text(self, tab_index=None):
-        """Get page text content - returns async result placeholder."""
-        return {"status": "ok", "note": "Use /tabs endpoint to get current URLs, then fetch content via the browser"}
-
     def api_snapshot(self, tab_index=None):
-        """Get a lightweight snapshot of the current page state."""
-        tabs = self.api_get_tabs()
         return {
-            "active_profile": self.current_profile_id,
-            "tabs": tabs,
-            "active_tab": self.tab_widget.currentIndex(),
+            "open_windows": list(self.open_windows.keys()),
+            "tabs": self.api_get_tabs(),
         }
 
 
@@ -1718,33 +1579,72 @@ class APIHandler(BaseHTTPRequestHandler):
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
-def main():
-    # Handle Ctrl+C gracefully
+def run_profile_process(profile_id, relay_port):
+    """Entry point for a subprocess that runs a single profile window.
+    Each subprocess gets its own Chromium instance with its own --proxy-server."""
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-    # Start local proxy relay BEFORE Qt/Chromium init
-    relay = ProxyRelay(LOCAL_PROXY_PORT)
+    relay = ProxyRelay(relay_port)
     relay.start()
 
-    # Tell Chromium to route all traffic through our local relay
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
-        f"--proxy-server=http://127.0.0.1:{LOCAL_PROXY_PORT} "
-        "--proxy-bypass-list=<-loopback>"  # only bypass actual loopback
+        f"--proxy-server=http://127.0.0.1:{relay_port} "
+        "--proxy-bypass-list=<-loopback>"
     )
 
-    app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
-    app.setApplicationVersion(APP_VERSION)
-
-    # Apply dark theme
+    app = QApplication([sys.argv[0], "--profile", profile_id])
+    app.setApplicationName(f"{APP_NAME} - {profile_id}")
     app.setStyleSheet(DARK_STYLE)
 
-    browser = GhostSurfBrowser(relay)
-    browser.show()
+    pm = ProfileManager()
+    config = pm.get_profile(profile_id)
+    if not config:
+        print(f"[GhostSurf] Profile '{profile_id}' not found")
+        sys.exit(1)
+
+    # Apply proxy to relay
+    proxy_config = config.get("proxy", {})
+    if proxy_config.get("enabled"):
+        relay.set_upstream(
+            proxy_config.get("host", ""),
+            proxy_config.get("port", 0),
+            proxy_config.get("type", "http"),
+            proxy_config.get("username", ""),
+            proxy_config.get("password", ""),
+        )
+
+    window = ProfileWindow(profile_id, config, pm, relay_port, relay=relay)
+    window.show()
 
     ret = app.exec()
     relay.stop()
     sys.exit(ret)
+
+
+def main():
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    # If launched as a profile subprocess
+    if "--profile" in sys.argv:
+        idx = sys.argv.index("--profile")
+        profile_id = sys.argv[idx + 1]
+        relay_port = int(sys.argv[sys.argv.index("--relay-port") + 1]) if "--relay-port" in sys.argv else LOCAL_PROXY_PORT
+        run_profile_process(profile_id, relay_port)
+        return
+
+    # Otherwise, run the launcher
+    # Launcher doesn't need a proxy relay itself
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = ""
+
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+    app.setStyleSheet(DARK_STYLE)
+
+    launcher = GhostSurfLauncher()
+    launcher.show()
+
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
