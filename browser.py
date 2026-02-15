@@ -13,6 +13,7 @@ import signal
 import socket
 import select
 import base64
+import queue
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -968,6 +969,9 @@ class ProfileWindow(QMainWindow):
     proxy relay so there is zero cross-profile leakage."""
 
     window_closed = pyqtSignal(str)  # emits profile_id on close
+    _js_execute_signal = pyqtSignal(str, int, int)   # code, tab_index, queue_id
+    _navigate_signal = pyqtSignal(str, int, int)     # url, tab_index, queue_id
+    _new_tab_signal = pyqtSignal(str, int)           # url, queue_id
 
     def __init__(self, profile_id, profile_config, profile_manager, relay_port, relay=None):
         super().__init__()
@@ -977,6 +981,10 @@ class ProfileWindow(QMainWindow):
         self.qt_profile = None
         self.tabs = []
 
+        self._pending_results = {}  # queue_id -> queue.Queue
+        self._next_queue_id = 0
+        self._queue_lock = threading.Lock()
+
         # Use provided relay or create a new one
         if relay is not None:
             self.proxy_relay = relay
@@ -984,6 +992,11 @@ class ProfileWindow(QMainWindow):
             self.proxy_relay = ProxyRelay(relay_port)
             self.proxy_relay.start()
         self._apply_proxy(profile_config.get("proxy", {}))
+
+        # Connect API signals for thread-safe calls
+        self._js_execute_signal.connect(self._on_js_execute)
+        self._navigate_signal.connect(self._on_navigate)
+        self._new_tab_signal.connect(self._on_new_tab)
 
         self._setup_ui()
         self._setup_shortcuts()
@@ -1226,7 +1239,94 @@ class ProfileWindow(QMainWindow):
                 result.append({"index": i, "url": widget.current_url(), "title": widget.current_title()})
         return result
 
+    # ── Signal slots for thread-safe API calls ──
+
+    def _resolve_queue(self, queue_id, data):
+        with self._queue_lock:
+            q = self._pending_results.pop(queue_id, None)
+        if q:
+            q.put(data)
+
+    def register_queue(self, q):
+        with self._queue_lock:
+            qid = self._next_queue_id
+            self._next_queue_id = (self._next_queue_id + 1) % 2000000000
+            self._pending_results[qid] = q
+        return qid
+
+    @pyqtSlot(str, int, int)
+    def _on_js_execute(self, code, tab_index, queue_id):
+        idx = tab_index if tab_index >= 0 else self.tab_widget.currentIndex()
+        widget = self.tab_widget.widget(idx)
+        if not widget or not hasattr(widget, 'web_view'):
+            self._resolve_queue(queue_id, {"error": "No tab at that index"})
+            return
+        page = widget.web_view.page()
+        page.runJavaScript(code, 0, lambda result: self._resolve_queue(queue_id, {"result": result}))
+
+    @pyqtSlot(str, int, int)
+    def _on_navigate(self, url, tab_index, queue_id):
+        idx = tab_index if tab_index >= 0 else self.tab_widget.currentIndex()
+        result = self.api_navigate_tab(url, idx)
+        self._resolve_queue(queue_id, result)
+
+    @pyqtSlot(str, int)
+    def _on_new_tab(self, url, queue_id):
+        result = self.api_new_tab_url(url if url else None)
+        self._resolve_queue(queue_id, result)
+
+    # ── Per-profile API ──
+
+    def start_api(self, port):
+        """Start a local API server for this profile window."""
+        self._api_port = port
+        handler = partial(ProfileAPIHandler, self)
+        try:
+            self._api_server = HTTPServer(("127.0.0.1", port), handler)
+            threading.Thread(target=self._api_server.serve_forever, daemon=True).start()
+            print(f"[GhostSurf:{self.profile_id}] Profile API on http://127.0.0.1:{port}")
+        except OSError as e:
+            print(f"[GhostSurf:{self.profile_id}] Profile API failed: {e}")
+            self._api_server = None
+
+    def api_execute_js(self, code, tab_index=None, callback=None):
+        """Execute JS in a tab and return the result via callback."""
+        idx = tab_index if tab_index is not None else self.tab_widget.currentIndex()
+        widget = self.tab_widget.widget(idx)
+        if not widget or not hasattr(widget, 'web_view'):
+            if callback:
+                callback({"error": "No tab at that index"})
+            return
+        page = widget.web_view.page()
+        page.runJavaScript(code, 0, lambda result: callback({"result": result}) if callback else None)
+
+    def api_navigate_tab(self, url, tab_index=None):
+        idx = tab_index if tab_index is not None and tab_index >= 0 else self.tab_widget.currentIndex()
+        widget = self.tab_widget.widget(idx)
+        if not widget or not hasattr(widget, 'navigate'):
+            return {"error": "No tab at that index"}
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        widget.navigate(url)
+        self.url_bar.setText(url)
+        return {"status": "ok", "url": url, "tab": idx}
+
+    def api_get_tabs_info(self):
+        return self.get_tabs_info()
+
+    def api_new_tab_url(self, url=None):
+        idx = self._new_tab(url)
+        return {"status": "ok", "tab_index": idx}
+
+    def api_close_tab_idx(self, index):
+        if self.tab_widget.count() <= 1:
+            return {"error": "Cannot close last tab"}
+        self._close_tab(index)
+        return {"status": "ok"}
+
     def closeEvent(self, event):
+        if hasattr(self, '_api_server') and self._api_server:
+            self._api_server.shutdown()
         self.proxy_relay.stop()
         self.window_closed.emit(self.profile_id)
         super().closeEvent(event)
@@ -1244,8 +1344,9 @@ class GhostSurfLauncher(QMainWindow):
     def __init__(self):
         super().__init__()
         self.profile_manager = ProfileManager()
-        self.open_windows = {}  # profile_id -> subprocess.Popen
+        self.open_windows = {}   # profile_id -> {"proc": Popen, "api_port": int}
         self._next_relay_port = LOCAL_PROXY_PORT
+        self._next_api_port = API_DEFAULT_PORT + 1  # 9379, 9380, ...
         self.api_server = None
 
         # Connect signals for thread-safe calls from API handler
@@ -1259,6 +1360,11 @@ class GhostSurfLauncher(QMainWindow):
     def _alloc_relay_port(self):
         port = self._next_relay_port
         self._next_relay_port += 1
+        return port
+
+    def _alloc_api_port(self):
+        port = self._next_api_port
+        self._next_api_port += 1
         return port
 
     def _setup_ui(self):
@@ -1333,8 +1439,8 @@ class GhostSurfLauncher(QMainWindow):
     def _open_profile(self, profile_id):
         if profile_id in self.open_windows:
             # Check if process is still running
-            proc = self.open_windows[profile_id]
-            if proc.poll() is None:
+            info = self.open_windows[profile_id]
+            if info["proc"].poll() is None:
                 return  # still running
             else:
                 del self.open_windows[profile_id]
@@ -1343,14 +1449,16 @@ class GhostSurfLauncher(QMainWindow):
         if not config:
             return
 
-        port = self._alloc_relay_port()
+        relay_port = self._alloc_relay_port()
+        api_port = self._alloc_api_port()
         import subprocess as sp
         proc = sp.Popen([
             sys.executable, __file__,
             "--profile", profile_id,
-            "--relay-port", str(port),
+            "--relay-port", str(relay_port),
+            "--api-port", str(api_port),
         ])
-        self.open_windows[profile_id] = proc
+        self.open_windows[profile_id] = {"proc": proc, "api_port": api_port}
         self._refresh_list()
 
         # Monitor for exit in background thread
@@ -1457,9 +1565,9 @@ class GhostSurfLauncher(QMainWindow):
             print(f"[GhostSurf] API failed: {e}")
 
     def closeEvent(self, event):
-        for proc in list(self.open_windows.values()):
-            if proc.poll() is None:
-                proc.terminate()
+        for info in list(self.open_windows.values()):
+            if info["proc"].poll() is None:
+                info["proc"].terminate()
         if self.api_server:
             self.api_server.shutdown()
         super().closeEvent(event)
@@ -1467,9 +1575,13 @@ class GhostSurfLauncher(QMainWindow):
     # ── API Methods ──
 
     def api_get_status(self):
+        windows = {}
+        for pid, info in self.open_windows.items():
+            if info["proc"].poll() is None:
+                windows[pid] = {"api_port": info["api_port"]}
         return {
             "app": APP_NAME, "version": APP_VERSION,
-            "open_windows": list(self.open_windows.keys()),
+            "open_windows": windows,
             "profiles": list(self.profile_manager.profiles.keys()),
         }
 
@@ -1478,7 +1590,8 @@ class GhostSurfLauncher(QMainWindow):
 
     def api_get_tabs(self):
         # Tabs are in separate processes; return which profiles are open
-        return {pid: "running" for pid, proc in self.open_windows.items() if proc.poll() is None}
+        return {pid: {"status": "running", "api_port": info["api_port"]}
+                for pid, info in self.open_windows.items() if info["proc"].poll() is None}
 
     def api_navigate(self, url, tab_index=None):
         return {"status": "ok", "note": "Navigate via profile window directly", "url": url}
@@ -1558,7 +1671,26 @@ class APIHandler(BaseHTTPRequestHandler):
         if handler:
             handler()
         else:
-            self._send_json({"error": "Not found", "available": list(routes.keys())}, 404)
+            # Proxy GET to profile subprocess: /p/{profile_id}/{action}
+            import re
+            m = re.match(r'^/p/([^/]+)(/.*)?$', path)
+            if m:
+                profile_id = m.group(1)
+                sub_path = m.group(2) or "/"
+                info = self.browser.open_windows.get(profile_id)
+                if not info or info["proc"].poll() is not None:
+                    self._send_json({"error": f"Profile '{profile_id}' is not running"}, 404)
+                    return
+                api_port = info["api_port"]
+                try:
+                    import urllib.request
+                    resp = urllib.request.urlopen(f"http://127.0.0.1:{api_port}{sub_path}", timeout=5)
+                    data = json.loads(resp.read())
+                    self._send_json(data)
+                except Exception as e:
+                    self._send_json({"error": str(e)}, 502)
+            else:
+                self._send_json({"error": "Not found", "available": list(routes.keys())}, 404)
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -1604,10 +1736,36 @@ class APIHandler(BaseHTTPRequestHandler):
             self._send_json(self.browser.api_snapshot())
 
         else:
-            self._send_json({
-                "error": "Not found",
-                "available_post": ["/navigate", "/tabs", "/tabs/close", "/profiles", "/profiles/switch", "/snapshot"]
-            }, 404)
+            # Proxy to profile subprocess: /p/{profile_id}/{action}
+            import re
+            m = re.match(r'^/p/([^/]+)(/.*)?$', path)
+            if m:
+                profile_id = m.group(1)
+                sub_path = m.group(2) or "/"
+                info = self.browser.open_windows.get(profile_id)
+                if not info or info["proc"].poll() is not None:
+                    self._send_json({"error": f"Profile '{profile_id}' is not running"}, 404)
+                    return
+                api_port = info["api_port"]
+                try:
+                    import urllib.request
+                    proxy_body = json.dumps(body).encode() if body else b"{}"
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{api_port}{sub_path}",
+                        data=proxy_body,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    resp = urllib.request.urlopen(req, timeout=20)
+                    data = json.loads(resp.read())
+                    self._send_json(data)
+                except Exception as e:
+                    self._send_json({"error": str(e)}, 502)
+            else:
+                self._send_json({
+                    "error": "Not found",
+                    "available_post": ["/navigate", "/tabs", "/tabs/close", "/profiles", "/profiles/switch", "/snapshot", "/p/{profile_id}/{execute|navigate|tabs}"]
+                }, 404)
 
     def do_DELETE(self):
         parsed = urlparse(self.path)
@@ -1623,9 +1781,116 @@ class APIHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Not found"}, 404)
 
 
+# ─── Profile API Handler ─────────────────────────────────────────────────────
+
+class ProfileAPIHandler(BaseHTTPRequestHandler):
+    """HTTP API handler for an individual profile window.
+    Supports JS execution, navigation, and tab management."""
+
+    def __init__(self, window, *args, **kwargs):
+        self.window = window
+        super().__init__(*args, **kwargs)
+
+    def log_message(self, format, *args):
+        pass
+
+    def _send_json(self, data, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data, indent=2).encode())
+
+    def _read_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 0:
+            return json.loads(self.rfile.read(length))
+        return {}
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+
+        if path in ("", "/status"):
+            tabs = self.window.api_get_tabs_info()
+            self._send_json({
+                "profile": self.window.profile_id,
+                "tabs": tabs,
+                "current_tab": self.window.tab_widget.currentIndex(),
+            })
+        elif path == "/tabs":
+            self._send_json(self.window.api_get_tabs_info())
+        else:
+            self._send_json({"error": "Not found"}, 404)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+
+        try:
+            body = self._read_body()
+        except Exception:
+            body = {}
+
+        if path == "/execute":
+            code = body.get("js", "")
+            tab_index = body.get("tab_index")
+            if not code:
+                self._send_json({"error": "js is required"}, 400)
+                return
+            result_q = queue.Queue()
+            qid = self.window.register_queue(result_q)
+            self.window._js_execute_signal.emit(code, tab_index if tab_index is not None else -1, qid)
+            try:
+                result = result_q.get(timeout=15)
+                self._send_json(result)
+            except queue.Empty:
+                self._send_json({"error": "JS execution timed out"}, 504)
+
+        elif path == "/navigate":
+            url = body.get("url", "")
+            tab_index = body.get("tab_index")
+            if not url:
+                self._send_json({"error": "url is required"}, 400)
+                return
+            result_q = queue.Queue()
+            qid = self.window.register_queue(result_q)
+            self.window._navigate_signal.emit(url, tab_index if tab_index is not None else -1, qid)
+            try:
+                result = result_q.get(timeout=5)
+                self._send_json(result)
+            except queue.Empty:
+                self._send_json({"error": "Navigate timed out"}, 504)
+
+        elif path == "/tabs":
+            url = body.get("url")
+            result_q = queue.Queue()
+            qid = self.window.register_queue(result_q)
+            self.window._new_tab_signal.emit(url or "", qid)
+            try:
+                result = result_q.get(timeout=5)
+                self._send_json(result)
+            except queue.Empty:
+                self._send_json({"error": "New tab timed out"}, 504)
+
+        elif path == "/tabs/close":
+            index = body.get("index", 0)
+            self._send_json(self.window.api_close_tab_idx(index))
+
+        else:
+            self._send_json({"error": "Not found"}, 404)
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
-def run_profile_process(profile_id, relay_port):
+def run_profile_process(profile_id, relay_port, api_port=None):
     """Entry point for a subprocess that runs a single profile window.
     Each subprocess gets its own Chromium instance with its own --proxy-server."""
     signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -1662,6 +1927,8 @@ def run_profile_process(profile_id, relay_port):
         )
 
     window = ProfileWindow(profile_id, config, pm, relay_port, relay=relay)
+    if api_port:
+        window.start_api(api_port)
     window.show()
 
     ret = app.exec()
@@ -1677,7 +1944,8 @@ def main():
         idx = sys.argv.index("--profile")
         profile_id = sys.argv[idx + 1]
         relay_port = int(sys.argv[sys.argv.index("--relay-port") + 1]) if "--relay-port" in sys.argv else LOCAL_PROXY_PORT
-        run_profile_process(profile_id, relay_port)
+        api_port = int(sys.argv[sys.argv.index("--api-port") + 1]) if "--api-port" in sys.argv else None
+        run_profile_process(profile_id, relay_port, api_port)
         return
 
     # Otherwise, run the launcher
