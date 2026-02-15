@@ -67,19 +67,44 @@ if (navigator.mediaDevices) {
     navigator.mediaDevices.getUserMedia = undefined;
 }
 
-// Spoof canvas fingerprint
-const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-HTMLCanvasElement.prototype.toDataURL = function(type) {
-    const ctx = this.getContext('2d');
-    if (ctx) {
-        const imageData = ctx.getImageData(0, 0, this.width, this.height);
+// Spoof canvas fingerprint — covers toDataURL, toBlob, and getImageData
+(function() {
+    function addNoise(imageData) {
         for (let i = 0; i < imageData.data.length; i += 4) {
-            imageData.data[i] ^= 1;     // tiny noise
+            imageData.data[i] ^= 1;
+            imageData.data[i+1] ^= 1;
         }
-        ctx.putImageData(imageData, 0, 0);
     }
-    return origToDataURL.apply(this, arguments);
-};
+
+    const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    HTMLCanvasElement.prototype.toDataURL = function(type) {
+        const ctx = this.getContext('2d');
+        if (ctx) {
+            const id = ctx.getImageData(0, 0, this.width, this.height);
+            addNoise(id);
+            ctx.putImageData(id, 0, 0);
+        }
+        return origToDataURL.apply(this, arguments);
+    };
+
+    const origToBlob = HTMLCanvasElement.prototype.toBlob;
+    HTMLCanvasElement.prototype.toBlob = function(callback, type, quality) {
+        const ctx = this.getContext('2d');
+        if (ctx) {
+            const id = ctx.getImageData(0, 0, this.width, this.height);
+            addNoise(id);
+            ctx.putImageData(id, 0, 0);
+        }
+        return origToBlob.apply(this, arguments);
+    };
+
+    const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+    CanvasRenderingContext2D.prototype.getImageData = function() {
+        const id = origGetImageData.apply(this, arguments);
+        addNoise(id);
+        return id;
+    };
+})();
 
 // Spoof WebGL renderer
 const getParam = WebGLRenderingContext.prototype.getParameter;
@@ -98,6 +123,19 @@ Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
 // Block battery API
 if (navigator.getBattery) {
     navigator.getBattery = undefined;
+}
+
+// Enforce Do Not Track
+Object.defineProperty(navigator, 'doNotTrack', { get: () => '1' });
+
+// Also spoof WebGL2
+if (typeof WebGL2RenderingContext !== 'undefined') {
+    const getParam2 = WebGL2RenderingContext.prototype.getParameter;
+    WebGL2RenderingContext.prototype.getParameter = function(param) {
+        if (param === 37445) return 'Intel Inc.';
+        if (param === 37446) return 'Intel Iris OpenGL Engine';
+        return getParam2.apply(this, arguments);
+    };
 }
 """
 
@@ -1062,6 +1100,14 @@ class ProfileWindow(QMainWindow):
             )
             ua = self.profile_config.get("user_agent", DEFAULT_USER_AGENTS[0])
             self.qt_profile.setHttpUserAgent(ua)
+
+            privacy = self.profile_config.get("privacy", {})
+
+            # Block third-party cookies
+            if privacy.get("block_third_party_cookies"):
+                self.qt_profile.cookieStore().setCookieFilter(
+                    lambda request: not request.thirdParty
+                )
         return self.qt_profile
 
     def _apply_proxy(self, proxy_config):
@@ -1589,7 +1635,9 @@ def run_profile_process(profile_id, relay_port):
 
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
         f"--proxy-server=http://127.0.0.1:{relay_port} "
-        "--proxy-bypass-list=<-loopback>"
+        "--proxy-bypass-list=<-loopback> "
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp "
+        "--disable-features=WebRtcHideLocalIpsWithMdns"
     )
 
     app = QApplication([sys.argv[0], "--profile", profile_id])
